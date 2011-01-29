@@ -8,24 +8,28 @@
 #import "HTTPOperation.h"
 
 @interface HTTPOperation ()
-
+ 
 // Read/write versions of public properties
-
+ 
 @property (copy,   readwrite) NSURLRequest *        lastRequest;
 @property (copy,   readwrite) NSHTTPURLResponse *   lastResponse;
-
+ 
 // Internal properties
-
+ 
 @property (retain, readwrite) NSURLConnection *     connection;
 @property (assign, readwrite) BOOL                  firstData;
 @property (retain, readwrite) NSMutableData *       dataAccumulator;
-
+ 
+#if ! defined(NDEBUG)
+@property (retain, readwrite) NSTimer *             debugDelayTimer;
+#endif
+ 
 @end
-
-@implementation QHTTPOperation
-
+ 
+@implementation HTTPOperation
+ 
 #pragma mark * Initialise and finalise
-
+ 
 - (id)initWithRequest:(NSURLRequest *)request
     // See comment in header.
 {
@@ -48,16 +52,21 @@
     }
     return self;
 }
-
+ 
 - (id)initWithURL:(NSURL *)url
     // See comment in header.
 {
     assert(url != nil);
     return [self initWithRequest:[NSURLRequest requestWithURL:url]];
 }
-
+ 
 - (void)dealloc
 {
+    #if ! defined(NDEBUG)
+        [self->_debugError release];
+        [self->_debugDelayTimer invalidate];
+        [self->_debugDelayTimer release];
+    #endif
     // any thread
     [self->_request release];
     [self->_acceptableStatusCodes release];
@@ -70,25 +79,45 @@
     [self->_responseBody release];
     [super dealloc];
 }
-
+ 
 #pragma mark * Properties
-
+ 
 // We write our own settings for many properties because we want to bounce 
 // sets that occur in the wrong state.  And, given that we've written the 
 // setter anyway, we also avoid KVO notifications when the value doesn't change.
-
+ 
 @synthesize request = _request;
-
+ 
+@synthesize authenticationDelegate = _authenticationDelegate;
+ 
++ (BOOL)automaticallyNotifiesObserversOfAuthenticationDelegate
+{
+    return NO;
+}
+ 
+- (void)setAuthenticationDelegate:(id<HTTPOperationAuthenticationDelegate>)newValue
+{
+    if (self.state != kBaseOperationStateInited) {
+        assert(NO);
+    } else {
+        if (newValue != self->_authenticationDelegate) {
+            [self willChangeValueForKey:@"authenticationDelegate"];
+            self->_authenticationDelegate = newValue;
+            [self didChangeValueForKey:@"authenticationDelegate"];
+        }
+    }
+}
+ 
 @synthesize acceptableStatusCodes = _acceptableStatusCodes;
-
+ 
 + (BOOL)automaticallyNotifiesObserversOfAcceptableStatusCodes
 {
     return NO;
 }
-
+ 
 - (void)setAcceptableStatusCodes:(NSIndexSet *)newValue
 {
-    if (self.state != kQRunLoopOperationStateInited) {
+    if (self.state != kBaseOperationStateInited) {
         assert(NO);
     } else {
         if (newValue != self->_acceptableStatusCodes) {
@@ -99,17 +128,17 @@
         }
     }
 }
-
+ 
 @synthesize acceptableContentTypes = _acceptableContentTypes;
-
+ 
 + (BOOL)automaticallyNotifiesObserversOfAcceptableContentTypes
 {
     return NO;
 }
-
+ 
 - (void)setAcceptableContentTypes:(NSSet *)newValue
 {
-    if (self.state != kQRunLoopOperationStateInited) {
+    if (self.state != kBaseOperationStateInited) {
         assert(NO);
     } else {
         if (newValue != self->_acceptableContentTypes) {
@@ -120,14 +149,14 @@
         }
     }
 }
-
+ 
 @synthesize responseOutputStream = _responseOutputStream;
-
+ 
 + (BOOL)automaticallyNotifiesObserversOfResponseOutputStream
 {
     return NO;
 }
-
+ 
 - (void)setResponseOutputStream:(NSOutputStream *)newValue
 {
     if (self.dataAccumulator != nil) {
@@ -141,14 +170,14 @@
         }
     }
 }
-
+ 
 @synthesize defaultResponseSize   = _defaultResponseSize;
-
+ 
 + (BOOL)automaticallyNotifiesObserversOfDefaultResponseSize
 {
     return NO;
 }
-
+ 
 - (void)setDefaultResponseSize:(NSUInteger)newValue
 {
     if (self.dataAccumulator != nil) {
@@ -161,14 +190,14 @@
         }
     }
 }
-
+ 
 @synthesize maximumResponseSize = _maximumResponseSize;
-
+ 
 + (BOOL)automaticallyNotifiesObserversOfMaximumResponseSize
 {
     return NO;
 }
-
+ 
 - (void)setMaximumResponseSize:(NSUInteger)newValue
 {
     if (self.dataAccumulator != nil) {
@@ -181,20 +210,20 @@
         }
     }
 }
-
+ 
 @synthesize lastRequest     = _lastRequest;
 @synthesize lastResponse    = _lastResponse;
 @synthesize responseBody    = _responseBody;
-
+ 
 @synthesize connection      = _connection;
 @synthesize firstData       = _firstData;
 @synthesize dataAccumulator = _dataAccumulator;
-
+ 
 - (NSURL *)URL
 {
     return [self.request URL];
 }
-
+ 
 - (BOOL)isStatusCodeAcceptable
 {
     NSIndexSet *    acceptableStatusCodes;
@@ -211,7 +240,7 @@
     statusCode = [self.lastResponse statusCode];
     return (statusCode >= 0) && [acceptableStatusCodes containsIndex: (NSUInteger) statusCode];
 }
-
+ 
 - (BOOL)isContentTypeAcceptable
 {
     NSString *  contentType;
@@ -220,15 +249,15 @@
     contentType = [self.lastResponse MIMEType];
     return (self.acceptableContentTypes == nil) || ((contentType != nil) && [self.acceptableContentTypes containsObject:contentType]);
 }
-
+ 
 #pragma mark * Start and finish overrides
-
+ 
 - (void)operationDidStart
-    // Called by QRunLoopOperation when the operation starts.  This kicks of an 
+    // Called by QBaseOperation when the operation starts.  This kicks of an 
     // asynchronous NSURLConnection.
 {
-    assert(self.isActualRunLoopThread);
-    assert(self.state == kQRunLoopOperationStateExecuting);
+    assert(self.isActualBaseThread);
+    assert(self.state == kBaseOperationStateExecuting);
     
     assert(self.defaultResponseSize > 0);
     assert(self.maximumResponseSize > 0);
@@ -241,45 +270,54 @@
         [self finishWithError:[NSError errorWithDomain:NSCocoaErrorDomain code:NSUserCancelledError userInfo:nil]];
     } else {
     
+        // If a debug error is set, apply that error rather than running the connection.
+        
+        #if ! defined(NDEBUG)
+            if (self.debugError != nil) {
+                [self finishWithError:self.debugError];
+                return;
+            }
+        #endif
+ 
         // Create a connection that's scheduled in the required run loop modes.
         
         self.connection = [[[NSURLConnection alloc] initWithRequest:self.request delegate:self startImmediately:NO] autorelease];
         assert(self.connection != nil);
         
-        for (NSString * mode in self.actualRunLoopModes) {
-            [self.connection scheduleInRunLoop:[NSRunLoop currentRunLoop] forMode:mode];
+        for (NSString * mode in self.actualBaseModes) {
+            [self.connection scheduleInBase:[NSRunLoop currentBase] forMode:mode];
         }
         
         [self.connection start];
     }
 }
-
+ 
 - (void)operationWillFinish
-    // Called by QRunLoopOperation when the operation has finished.  We 
+    // Called by QBaseOperation when the operation has finished.  We 
     // do various bits of tidying up.
 {
-    assert(self.isActualRunLoopThread);
-    assert(self.state == kQRunLoopOperationStateExecuting);
-
+    assert(self.isActualBaseThread);
+    assert(self.state == kBaseOperationStateExecuting);
+ 
     // I can't think of any circumstances under which the debug delay timer 
     // might still be running at this point, but add an assert just to be sure.
     
     #if ! defined(NDEBUG)
         assert(self.debugDelayTimer == nil);
     #endif
-
+ 
     [self.connection cancel];
     self.connection = nil;
-
+ 
     // If we have an output stream, close it at this point.  We might never 
     // have actually opened this stream but, AFAICT, closing an unopened stream 
     // doesn't hurt. 
-
+ 
     if (self.responseOutputStream != nil) {
         [self.responseOutputStream close];
     }
 }
-
+ 
 - (void)finishWithError:(NSError *)error
     // We override -finishWithError: just so we can handle our debug delay.
 {
@@ -292,54 +330,114 @@
             assert(self.debugDelayTimer == nil);
             self.debugDelayTimer = [NSTimer timerWithTimeInterval:self.debugDelay target:self selector:@selector(debugDelayTimerDone:) userInfo:self.error repeats:NO];
             assert(self.debugDelayTimer != nil);
-            for (NSString * mode in self.actualRunLoopModes) {
-                [[NSRunLoop currentRunLoop] addTimer:self.debugDelayTimer forMode:mode];
+            for (NSString * mode in self.actualBaseModes) {
+                [[NSRunLoop currentBase] addTimer:self.debugDelayTimer forMode:mode];
             }
             self.debugDelay = 0.0;
             return;
         } 
     #endif
-
+ 
     [super finishWithError:error];
 }
-
-
+ 
+#if ! defined(NDEBUG)
+ 
+@synthesize debugError      = _debugError;
+@synthesize debugDelay      = _debugDelay;
+@synthesize debugDelayTimer = _debugDelayTimer;
+ 
+- (void)debugDelayTimerDone:(NSTimer *)timer
+{
+    NSError *   error;
+    
+    assert(timer == self.debugDelayTimer);
+ 
+    error = [[[timer userInfo] retain] autorelease];
+    assert( (error == nil) || [error isKindOfClass:[NSError class]] );
+    
+    [self.debugDelayTimer invalidate];
+    self.debugDelayTimer = nil;
+    
+    [self finishWithError:error];
+}
+ 
+#endif
+ 
 #pragma mark * NSURLConnection delegate callbacks
-
+ 
+- (BOOL)connection:(NSURLConnection *)connection canAuthenticateAgainstProtectionSpace:(NSURLProtectionSpace *)protectionSpace
+    // See comment in header.
+{
+    BOOL    result;
+    
+    assert(self.isActualBaseThread);
+    assert(connection == self.connection);
+    #pragma unused(connection)
+    assert(protectionSpace != nil);
+    #pragma unused(protectionSpace)
+    
+    result = NO;
+    if (self.authenticationDelegate != nil) {
+        result = [self.authenticationDelegate httpOperation:self canAuthenticateAgainstProtectionSpace:protectionSpace];
+    }
+    return result;
+}
+ 
+- (void)connection:(NSURLConnection *)connection didReceiveAuthenticationChallenge:(NSURLAuthenticationChallenge *)challenge
+    // See comment in header.
+{
+    assert(self.isActualBaseThread);
+    assert(connection == self.connection);
+    #pragma unused(connection)
+    assert(challenge != nil);
+    #pragma unused(challenge)
+    
+    if (self.authenticationDelegate != nil) {
+        [self.authenticationDelegate httpOperation:self didReceiveAuthenticationChallenge:challenge];
+    } else {
+        if ( [challenge previousFailureCount] == 0 ) {
+            [[challenge sender] continueWithoutCredentialForAuthenticationChallenge:challenge];
+        } else {
+            [[challenge sender] cancelAuthenticationChallenge:challenge];
+        }
+    }
+}
+ 
 - (NSURLRequest *)connection:(NSURLConnection *)connection willSendRequest:(NSURLRequest *)request redirectResponse:(NSURLResponse *)response
     // See comment in header.
 {
-    assert(self.isActualRunLoopThread);
+    assert(self.isActualBaseThread);
     assert(connection == self.connection);
     #pragma unused(connection)
     assert( (response == nil) || [response isKindOfClass:[NSHTTPURLResponse class]] );
-
+ 
     self.lastRequest  = request;
     self.lastResponse = (NSHTTPURLResponse *) response;
     return request;
 }
-
+ 
 - (void)connection:(NSURLConnection *)connection didReceiveResponse:(NSURLResponse *)response
     // See comment in header.
 {
-    assert(self.isActualRunLoopThread);
+    assert(self.isActualBaseThread);
     assert(connection == self.connection);
     #pragma unused(connection)
     assert([response isKindOfClass:[NSHTTPURLResponse class]]);
-
+ 
     self.lastResponse = (NSHTTPURLResponse *) response;
     
     // We don't check the status code here because we want to give the client an opportunity 
     // to get the data of the error message.  Perhaps we /should/ check the content type 
     // here, but I'm not sure whether that's the right thing to do.
 }
-
+ 
 - (void)connection:(NSURLConnection *)connection didReceiveData:(NSData *)data
     // See comment in header.
 {
     BOOL    success;
     
-    assert(self.isActualRunLoopThread);
+    assert(self.isActualBaseThread);
     assert(connection == self.connection);
     #pragma unused(connection)
     assert(data != nil);
@@ -363,7 +461,7 @@
             if (length <= (long long) self.maximumResponseSize) {
                 self.dataAccumulator = [NSMutableData dataWithCapacity:(NSUInteger)length];
             } else {
-                [self finishWithError:[NSError errorWithDomain:kQHTTPOperationErrorDomain code:kQHTTPOperationErrorResponseTooLarge userInfo:nil]];
+                [self finishWithError:[NSError errorWithDomain:kHTTPOperationErrorDomain code:kHTTPOperationErrorResponseTooLarge userInfo:nil]];
                 success = NO;
             }
         }
@@ -381,13 +479,13 @@
     }
     
     // Write the data to its destination.
-
+ 
     if (success) {
         if (self.dataAccumulator != nil) {
             if ( ([self.dataAccumulator length] + [data length]) <= self.maximumResponseSize ) {
                 [self.dataAccumulator appendData:data];
             } else {
-                [self finishWithError:[NSError errorWithDomain:kQHTTPOperationErrorDomain code:kQHTTPOperationErrorResponseTooLarge userInfo:nil]];
+                [self finishWithError:[NSError errorWithDomain:kHTTPOperationErrorDomain code:kHTTPOperationErrorResponseTooLarge userInfo:nil]];
             }
         } else {
             NSUInteger      dataOffset;
@@ -395,9 +493,9 @@
             const uint8_t * dataPtr;
             NSError *       error;
             NSInteger       bytesWritten;
-
+ 
             assert(self.responseOutputStream != nil);
-
+ 
             dataOffset = 0;
             dataLength = [data length];
             dataPtr    = [data bytes];
@@ -410,7 +508,7 @@
                 if (bytesWritten <= 0) {
                     error = [self.responseOutputStream streamError];
                     if (error == nil) {
-                        error = [NSError errorWithDomain:kQHTTPOperationErrorDomain code:kQHTTPOperationErrorOnOutputStream userInfo:nil];
+                        error = [NSError errorWithDomain:kHTTPOperationErrorDomain code:kHTTPOperationErrorOnOutputStream userInfo:nil];
                     }
                     break;
                 } else {
@@ -424,16 +522,16 @@
         }
     }
 }
-
+ 
 - (void)connectionDidFinishLoading:(NSURLConnection *)connection
     // See comment in header.
 {
-    assert(self.isActualRunLoopThread);
+    assert(self.isActualBaseThread);
     assert(connection == self.connection);
     #pragma unused(connection)
     
     assert(self.lastResponse != nil);
-
+ 
     // Swap the data accumulator over to the response data so that we don't trigger a copy.
     
     assert(self->_responseBody == nil);
@@ -441,25 +539,26 @@
     self->_dataAccumulator = nil;
     
     if ( ! self.isStatusCodeAcceptable ) {
-        [self finishWithError:[NSError errorWithDomain:kQHTTPOperationErrorDomain code:self.lastResponse.statusCode userInfo:nil]];
+        [self finishWithError:[NSError errorWithDomain:kHTTPOperationErrorDomain code:self.lastResponse.statusCode userInfo:nil]];
     } else if ( ! self.isContentTypeAcceptable ) {
-        [self finishWithError:[NSError errorWithDomain:kQHTTPOperationErrorDomain code:kQHTTPOperationErrorBadContentType userInfo:nil]];
+        [self finishWithError:[NSError errorWithDomain:kHTTPOperationErrorDomain code:kHTTPOperationErrorBadContentType userInfo:nil]];
     } else {
         [self finishWithError:nil];
     }
 }
-
+ 
 - (void)connection:(NSURLConnection *)connection didFailWithError:(NSError *)error
     // See comment in header.
 {
-    assert(self.isActualRunLoopThread);
+    assert(self.isActualBaseThread);
     assert(connection == self.connection);
     #pragma unused(connection)
     assert(error != nil);
-
+ 
     [self finishWithError:error];
 }
-
+ 
 @end
+ 
+NSString * kHTTPOperationErrorDomain = @"kHTTPOperationErrorDomain";
 
-NSString * kQHTTPOperationErrorDomain = @"kQHTTPOperationErrorDomain";

@@ -5,16 +5,10 @@
     Copyright:  MIT 
 */
  
-#include <Foundation/Foundation.h>
+#include "YouTubeVideo.h"
 
-@interface YouTubeVideo: NSObject
-{
-    NSString *      _downloadDirPath;
-    NSString *      _videoQuality;
-}
+@implementation YouTubeVideo
 
-// Things that are configured by the init method and can't be changed.
-@property (copy,   readwrite) NSString *    _downloadDirPath;
-@property (copy,   readwrite) NSString *    _videoQuality;
+
 
 @end

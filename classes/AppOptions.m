@@ -7,11 +7,8 @@
  
 #import "AppOptions.h" 
 
-@interface AppOptions: NSObject
-{
-    NSString *      _downloadDirPath;
-    NSString *      _videoQuality;
-}
+@implementation AppOptions
+
 
 - (id)initWithURL:(NSURL *)url videoDirPath:(NSString *)fileDirPath
 {
